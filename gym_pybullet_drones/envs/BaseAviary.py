@@ -33,9 +33,11 @@ class BaseAviary(gym.Env):
                  ctrl_freq: int = 240,
                  gui=False,
                  record=False,
+                 laser_record=False,
                  obstacles=False,
                  user_debug_gui=True,
                  vision_attributes=False,
+                 laser_attributes=False,
                  output_folder='results'
                  ):
         """Initialization of a generic aviary environment.
@@ -62,12 +64,16 @@ class BaseAviary(gym.Env):
             Whether to use PyBullet's GUI.
         record : bool, optional
             Whether to save a video of the simulation.
+        laser_record : bool, optional
+            Whether to save a pointcloud of the simulation in folder `files/pointcloud/`.
         obstacles : bool, optional
             Whether to add obstacles to the simulation.
         user_debug_gui : bool, optional
             Whether to draw the drones' axes and the GUI RPMs sliders.
         vision_attributes : bool, optional
             Whether to allocate the attributes needed by vision-based aviary subclasses.
+        laser_attributes : bool, optional
+            Whether to allocate the attributes needed by laser-based aviary subclasses.
 
         """
         #### Constants #############################################
@@ -88,6 +94,7 @@ class BaseAviary(gym.Env):
         self.DRONE_MODEL = drone_model
         self.GUI = gui
         self.RECORD = record
+        self.LASER_RECORD = laser_record
         self.PHYSICS = physics
         self.OBSTACLES = obstacles
         self.USER_DEBUG = user_debug_gui
@@ -144,6 +151,42 @@ class BaseAviary(gym.Env):
             if self.RECORD:
                 for i in range(self.NUM_DRONES):
                     os.makedirs(os.path.dirname(self.ONBOARD_IMG_PATH+"/drone_"+str(i)+"/"), exist_ok=True)
+        #### Create attributes for laser tasks ####################
+        self.LASER_ATTR = laser_attributes
+        if self.LASER_ATTR:
+            self.LASER_RES = np.array([512, 32]) # res,line
+            self.numRays = 16383 if self.LASER_RES[1]*self.LASER_RES[0]>16383 else self.LASER_RES[1]*self.LASER_RES[0]
+            self.LASER_MASK = 0.5 # Body MASK (m)
+            self.LASER_RANGE = 150 # Range (m)
+            self.LASER_FOV = np.pi*(45/180) # FOV: -LASER_FOV/2 ~ LASER_FOV/2
+            self.LASER_FRAME_PER_SEC = 6 # 6FPS
+            self.LASER_CAPTURE_FREQ = int(self.PYB_FREQ/self.LASER_FRAME_PER_SEC)
+            self.pointcloud = np.zeros(((self.NUM_DRONES, self.numRays, 3)))
+            if self.LASER_CAPTURE_FREQ%self.PYB_STEPS_PER_CTRL != 0:
+                print("[ERROR] in BaseAviary.__init__(), PyBullet and control frequencies incompatible with the desired pcl capture frame rate ({:f}Hz)".format(self.PYB_STEPS_PER_CTRL))
+                exit()
+            if self.LASER_RECORD:
+                self.ONBOARD_LASER_PATH = os.path.join(self.OUTPUT_FOLDER, "pointcloud_" + datetime.now().strftime("%m.%d.%Y_%H.%M.%S"))
+            #### Calculate From/To Array ########################################
+            ## theta:alt phi:azi
+            self.LASER_FROM = []
+            self.LASER_TO = []
+            for i in range(self.LASER_RES[1]):
+                for j in range(self.LASER_RES[0]):
+                    if i*self.LASER_RES[0]+j>self.numRays:
+                        break
+                    theta = self.LASER_FOV/2-i*self.LASER_FOV/self.LASER_RES[1]
+                    phi = j*2*np.pi/self.LASER_RES[0]
+                    # self.LASER_FROM.append([self.LASER_MASK*np.cos(theta)*np.cos(phi),
+                    #                         self.LASER_MASK*np.cos(theta)*np.sin(phi),
+                    #                         self.LASER_MASK*np.sin(theta)+0.15]) # add z-axis installation height
+                    self.LASER_FROM.append([0,0,0])
+                    self.LASER_TO.append([self.LASER_RANGE*np.cos(theta)*np.cos(phi),
+                                          self.LASER_RANGE*np.cos(theta)*np.sin(phi),
+                                          self.LASER_RANGE*np.sin(theta)+0])
+                if i*self.LASER_RES[0]+j>self.numRays:
+                    break
+                
         #### Connect to PyBullet ###################################
         if self.GUI:
             #### With debug GUI ########################################
@@ -652,6 +695,75 @@ class BaseAviary(gym.Env):
             exit()
         if img_type != ImageType.RGB:
             (Image.fromarray(temp)).save(os.path.join(path,"frame_"+str(frame_num)+".png"))
+
+    ################################################################################
+
+    def _getDroneRays(self,
+                      nth_drone,
+                      ):
+        """Returns LiDAR captures from the n-th drone POV.
+
+        Parameters
+        ----------
+        nth_drone : int
+            The ordinal number/position of the desired drone in list self.DRONE_IDS.
+
+        Returns
+        -------
+        ndarray 
+            (w, h, 3)-shaped array of uint8's containing the pointcloud captured from the n-th drone's POV.
+
+        """
+        if self.LASER_RES is None:
+            print("[ERROR] in BaseAviary._getDroneRays(), remember to set self.LASER_RES to np.array([res, line])")
+            exit()
+        rot_mat = np.array(p.getMatrixFromQuaternion(self.quat[nth_drone, :])).reshape(3, 3)
+
+        rayFrom = np.array(self.LASER_FROM)
+        rayTo = np.array(self.LASER_TO)
+
+        rayFrom = np.dot(rot_mat,rayFrom.T).T + np.array(self.pos[nth_drone, :])
+        rayTo = np.dot(rot_mat,rayTo.T).T + np.array(self.pos[nth_drone, :])
+        pointcloud = []
+        # max batch size:16383
+        results = p.rayTestBatch(rayFrom,rayTo,numThreads=0)
+        for i in range(self.numRays):
+            pointcloud.append(results[i][3])
+            if self.USER_DEBUG:
+                p.addUserDebugLine(rayFrom[i],rayTo[i],[0,1,0])
+        pointcloud = np.array(pointcloud)
+        return pointcloud
+
+    ################################################################################
+
+    def _exportPointCloud(self,
+                     pointcloud_input,
+                     path: str,
+                     frame_num: int=0
+                     ):
+        """Returns camera captures from the n-th drone POV.
+
+        Parameters
+        ----------
+        pointcloud_input : ndarray
+            (h*w, 3)-shaped array of float32 for pointcloud.
+        path : str
+            Path where to save the output as npy.
+        fram_num: int, optional
+            Frame number to append to the npy's filename.
+
+        """
+        if np.any(pointcloud_input):
+            if os.path.isdir(path):
+                np.save(os.path.join(path,"pointcloud_"+str(frame_num)+".npy"),pointcloud_input)
+            else:
+                os.mkdir(path)
+                np.save(os.path.join(path,"pointcloud_"+str(frame_num)+".npy"),pointcloud_input)
+        else:
+            print("[ERROR] in BaseAviary._exportPointCloud(), no point")
+            exit()
+
+    ################################################################################
 
     ################################################################################
 
